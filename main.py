@@ -4,6 +4,7 @@ from playwright.async_api import async_playwright
 import uvicorn
 import asyncio
 import logging
+import random
 from urllib.parse import urlparse
 
 # 配置日志
@@ -50,7 +51,7 @@ async def extract_m3u8(url: str = Query(..., description="The target video page 
                     "--no-sandbox", 
                     "--disable-setuid-sandbox", 
                     "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
+                    "--disable-blink-features=AutomationControlled", # 关键：隐藏自动化特征
                     "--disable-features=IsolateOrigins,site-per-process",
                     "--ignore-certificate-errors",
                     "--mute-audio"
@@ -62,19 +63,54 @@ async def extract_m3u8(url: str = Query(..., description="The target video page 
             context_options.update({
                 "locale": "zh-CN",
                 "timezone_id": "Asia/Shanghai",
-                "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+                # 更新更现代的 iOS UserAgent
+                "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+                # 添加 Referer 尝试欺骗
+                "extra_http_headers": {
+                    "Referer": url,
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
+                }
             })
             
             context = await browser.new_context(**context_options)
             
+            # 注入更深层的反指纹脚本
             await context.add_init_script("""
+                // 1. 隐藏 WebDriver
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.navigator.chrome = { runtime: {} };
+                
+                // 2. 伪造 Chrome 对象
+                window.navigator.chrome = {
+                    runtime: {},
+                    loadTimes: function() {},
+                    csi: function() {},
+                    app: {}
+                };
+                
+                // 3. 伪造 Permissions
+                const originalQuery = window.navigator.permissions.query;
                 window.navigator.permissions.query = (parameters) => (
                     parameters.name === 'notifications' ?
                     Promise.resolve({ state: Notification.permission }) :
-                    Promise.resolve({ state: 'granted' })
+                    originalQuery(parameters)
                 );
+                
+                // 4. 伪造 Plugins (iOS 通常没有插件，但为了覆盖默认的空数组特征)
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+
+                // 5. 伪造 WebGL Vendor
+                try {
+                    const getParameter = WebGLRenderingContext.prototype.getParameter;
+                    WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                        // UNMASKED_VENDOR_WEBGL
+                        if (parameter === 37445) return 'Apple Inc.';
+                        // UNMASKED_RENDERER_WEBGL
+                        if (parameter === 37446) return 'Apple GPU';
+                        return getParameter(parameter);
+                    };
+                } catch(e) {}
             """)
 
             page = await context.new_page()
@@ -116,60 +152,100 @@ async def extract_m3u8(url: str = Query(..., description="The target video page 
             page.on("request", handle_request)
 
             logger.info("Navigating...")
-            # 使用 try-except 包裹 goto 防止导航超时导致整个程序崩溃
+            # 使用 try-except 包裹 goto 防止导航超时
             try:
-                response = await page.goto(url, wait_until="commit", timeout=25000)
+                response = await page.goto(url, wait_until="commit", timeout=30000)
                 if response:
                     logger.info(f"Response status: {response.status}")
             except Exception as e:
                 logger.warning(f"Navigation warning (continuing): {e}")
 
-            await page.wait_for_load_state("domcontentloaded")
-            await asyncio.sleep(2)
+            # --- Cloudflare 绕过逻辑 ---
+            # 等待一小会儿检查标题
+            await asyncio.sleep(3)
+            page_title = await page.title()
+            result["debug_info"]["page_title"] = page_title
+            
+            if "Cloudflare" in page_title or "Attention" in page_title or "Just a moment" in page_title:
+                logger.info("Cloudflare detected! Attempting specific bypass...")
+                
+                # 1. 等待可能的自动跳转 (有些只是5秒盾)
+                await asyncio.sleep(6)
+                
+                # 2. 尝试寻找并点击 iframe 中的 checkbox (Turnstile)
+                try:
+                    # 查找所有 iframe
+                    frames = page.frames
+                    for frame in frames:
+                        # 尝试点击 frame 中心
+                        try:
+                            box = await frame.bounding_box()
+                            if box:
+                                # 随机偏移一点，模拟人类点击
+                                x = box['x'] + 10 + random.randint(0, 20)
+                                y = box['y'] + 10 + random.randint(0, 20)
+                                await page.mouse.click(x, y)
+                        except:
+                            pass
+                        
+                        # 尝试点击特定的 challenge 元素
+                        try:
+                            checkbox = frame.locator("input[type='checkbox'], #challenge-stage, .ctp-checkbox-label").first
+                            if await checkbox.count() > 0:
+                                await checkbox.click(force=True)
+                        except:
+                            pass
+                    
+                    # 再等待跳转
+                    await asyncio.sleep(5)
+                except Exception as e:
+                    logger.warning(f"Bypass interaction failed: {e}")
 
-            # 获取调试信息
+            await page.wait_for_load_state("domcontentloaded")
+
+            # 获取页面内容预览
             try:
-                result["debug_info"]["page_title"] = await page.title()
                 content = await page.evaluate("document.body.innerText")
                 result["debug_info"]["page_text_preview"] = content[:500] if content else "No content"
             except:
                 pass
 
-            # --- 交互策略 ---
-            logger.info("Starting interaction...")
-            
-            # 1. 暴力点击
-            try:
-                viewport = page.viewport_size
-                if viewport:
-                    await page.mouse.click(viewport['width'] / 2, viewport['height'] / 2)
-                    await asyncio.sleep(0.5)
-                    await page.mouse.click(viewport['width'] / 2, viewport['height'] / 3)
-            except Exception as e:
-                logger.warning(f"Click interaction failed: {e}")
-            
-            # 2. 遍历 Frame 点击
-            frames = page.frames
-            for frame in frames:
+            # --- 视频交互策略 ---
+            if not result["debug_info"]["all_video_candidates"]:
+                logger.info("Starting video interaction...")
+                
+                # 1. 暴力点击
                 try:
-                    await frame.locator("video").first.click(timeout=500, force=True)
-                except:
-                    pass
-                try:
-                    btns = frame.locator("div[class*='play'], button, img[src*='play']")
-                    count = await btns.count()
-                    for i in range(min(count, 3)):
-                        try:
-                            await btns.nth(i).click(timeout=300, force=True)
-                        except:
-                            pass
-                except:
-                    pass
+                    viewport = page.viewport_size
+                    if viewport:
+                        await page.mouse.click(viewport['width'] / 2, viewport['height'] / 2)
+                        await asyncio.sleep(0.5)
+                        await page.mouse.click(viewport['width'] / 2, viewport['height'] / 3)
+                except Exception as e:
+                    logger.warning(f"Click interaction failed: {e}")
+                
+                # 2. 遍历 Frame 点击
+                frames = page.frames
+                for frame in frames:
+                    try:
+                        await frame.locator("video").first.click(timeout=500, force=True)
+                    except:
+                        pass
+                    try:
+                        btns = frame.locator("div[class*='play'], button, img[src*='play']")
+                        count = await btns.count()
+                        for i in range(min(count, 3)):
+                            try:
+                                await btns.nth(i).click(timeout=300, force=True)
+                            except:
+                                pass
+                    except:
+                        pass
 
-            # 等待结果
-            for _ in range(5):
-                if result["debug_info"]["all_video_candidates"]: break
-                await asyncio.sleep(1)
+                # 等待结果
+                for i in range(8): # 延长等待时间
+                    if result["debug_info"]["all_video_candidates"]: break
+                    await asyncio.sleep(1)
 
     except Exception as e:
         logger.error(f"Critical Process Error: {e}")
@@ -205,9 +281,8 @@ async def extract_m3u8(url: str = Query(..., description="The target video page 
         result["status"] = "success"
     elif result["status"] != "error":
         result["status"] = "failed"
-        result["message"] = "No video traffic detected."
+        result["message"] = "No video traffic detected. Likely blocked by Cloudflare."
 
-    # 始终返回 200 OK 和 JSON，即使失败，以便前端能看到 debug_info
     return JSONResponse(content=result)
 
 if __name__ == "__main__":
