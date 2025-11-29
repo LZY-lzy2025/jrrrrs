@@ -1,17 +1,27 @@
-# 使用微软官方的 Playwright Python 镜像，包含浏览器环境
-# 这是一个较大的镜像，但最稳定
-FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
+# 1. 使用轻量级的 Python Slim 镜像 (Debian based)
+# 体积比 Ubuntu 基础镜像小很多
+FROM python:3.10-slim
 
+# 设置工作目录
 WORKDIR /app
+
+# 设置环境变量，防止 Python 生成 pyc 文件和缓冲输出
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 # 复制依赖文件
 COPY requirements.txt .
 
-# 安装 Python 依赖
-RUN pip install --no-cache-dir -r requirements.txt
-
-# 安装 Playwright 浏览器 (Chromium)
-RUN playwright install chromium
+# 2. 合并运行命令以减少镜像层数 (Layer)
+# - 更新 apt 源
+# - 安装 Python 依赖
+# - 使用 Playwright 安装 Chromium 及其系统依赖 (--with-deps)
+# - 清理 apt 缓存和 pip 缓存以减小体积
+RUN apt-get update && \
+    pip install --no-cache-dir -r requirements.txt && \
+    playwright install --with-deps chromium && \
+    rm -rf /var/lib/apt/lists/* && \
+    rm -rf /root/.cache/pip
 
 # 复制源代码
 COPY main.py .
