@@ -57,12 +57,15 @@ async def extract_m3u8(url: str = Query(..., description="The target video page 
                 ]
             )
             
-            context = await browser.new_context(
-                **device,
-                locale="zh-CN",
-                timezone_id="Asia/Shanghai",
-                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-            )
+            # 合并配置，避免参数冲突
+            context_options = device.copy()
+            context_options.update({
+                "locale": "zh-CN",
+                "timezone_id": "Asia/Shanghai",
+                "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+            })
+            
+            context = await browser.new_context(**context_options)
             
             await context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
