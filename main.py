@@ -1,8 +1,10 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
 from playwright.async_api import async_playwright
 import uvicorn
 import asyncio
 import logging
+from urllib.parse import urlparse
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -16,20 +18,24 @@ async def root():
 
 @app.get("/extract")
 async def extract_m3u8(url: str = Query(..., description="The target video page URL")):
-    if not url.startswith("http"):
-        raise HTTPException(status_code=400, detail="Invalid URL format")
-
     logger.info(f"Start sniffing: {url}")
     
-    captured_data = {
-        "m3u8": [],
-        "mp4": [],
-        "flv": []
+    # 数据容器
+    result = {
+        "status": "processing",
+        "video_url": None,
+        "source_type": None,
+        "debug_info": {
+            "page_title": "Unknown",
+            "page_text_preview": "",
+            "domains_contacted": set(),
+            "all_video_candidates": []
+        }
     }
     
     async with async_playwright() as p:
-        # 使用 iPhone 12 的设备配置，这样能自动处理 UserAgent, Viewport, DPR, 和 Touch 支持
-        device = p.devices['iPhone 12']
+        # 使用 iPhone 13 Pro 配置，伪装更彻底
+        device = p.devices['iPhone 13 Pro']
         
         browser = await p.chromium.launch(
             headless=True,
@@ -38,146 +44,178 @@ async def extract_m3u8(url: str = Query(..., description="The target video page 
                 "--disable-setuid-sandbox", 
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process", # 关键：允许跨域 iframe 访问
-                "--mute-audio" # 静音，防止音频相关报错
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--ignore-certificate-errors", # 忽略证书错误
+                "--mute-audio"
             ]
         )
         
-        # 创建上下文：使用移动端配置
         context = await browser.new_context(
-            **device, # 自动应用 iPhone 配置
+            **device,
             locale="zh-CN",
-            timezone_id="Asia/Shanghai"
+            timezone_id="Asia/Shanghai",
+            # 强制指定高版本 UserAgent
+            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
         )
         
-        # 再次注入防检测脚本
+        # 注入反爬脚本
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             window.navigator.chrome = { runtime: {} };
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                Promise.resolve({ state: 'granted' })
+            );
         """)
 
         page = await context.new_page()
 
-        # 监听请求
+        # --- 监听器设置 ---
+
+        # 1. 监听 WebSocket (新增)
+        def handle_websocket(ws):
+            url = ws.url
+            logger.info(f"WebSocket detected: {url}")
+            result["debug_info"]["domains_contacted"].add(urlparse(url).netloc)
+            if "szsummer" in url or ".flv" in url or ".m3u8" in url:
+                result["debug_info"]["all_video_candidates"].append(url)
+
+        page.on("websocket", handle_websocket)
+
+        # 2. 监听 HTTP 请求
         def handle_request(request):
             req_url = request.url
-            resource_type = request.resource_type
             
-            # 过滤不需要的资源以节省日志
-            if resource_type in ['image', 'font', 'stylesheet']:
-                return
+            # 记录访问过的域名，用于排查是否被重定向或加载了什么
+            try:
+                result["debug_info"]["domains_contacted"].add(urlparse(req_url).netloc)
+            except:
+                pass
 
-            # 检查 URL 或 Content-Type
+            # 视频特征匹配
             is_video = False
+            content_type = request.headers.get("content-type", "").lower()
             
-            if ".m3u8" in req_url or "application/vnd.apple.mpegurl" in str(request.headers.get("content-type", "")):
-                captured_data["m3u8"].append(req_url)
-                logger.info(f"✅ CAPTURED M3U8: {req_url}")
+            if ".m3u8" in req_url or "mpegurl" in content_type:
                 is_video = True
             elif ".mp4" in req_url:
-                captured_data["mp4"].append(req_url)
                 is_video = True
-            elif ".flv" in req_url:
-                captured_data["flv"].append(req_url)
+            elif ".flv" in req_url or "video/x-flv" in content_type:
                 is_video = True
-            
+            elif ".ts" in req_url and "segment" not in req_url: # 或者是 .ts 切片
+                # 记录 ts 切片但不作为首选，除非没别的
+                pass 
+
             if is_video:
-                # 打印详细 Headers 方便调试 auth_key 来源
-                logger.info(f"Headers: {request.headers}")
+                logger.info(f"Captured: {req_url}")
+                result["debug_info"]["all_video_candidates"].append(req_url)
 
         page.on("request", handle_request)
 
         try:
-            logger.info("Navigating to page...")
-            # 缩短超时时间，有些页面一直在加载广告，我们不需要等完全加载
+            logger.info("Navigating...")
+            # 增加 waitUntil: 'commit' 只要服务器响应就开始交互，防止卡在加载圈
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                response = await page.goto(url, wait_until="commit", timeout=25000)
+                if response:
+                    logger.info(f"Response status: {response.status}")
             except Exception as e:
-                logger.warning(f"Page load timeout (continuing): {e}")
+                logger.warning(f"Navigation soft timeout: {e}")
 
-            # 等待 2 秒让播放器初始化
+            # 等待 DOM 加载
+            await page.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(2)
+
+            # 获取调试信息：标题和页面内容
+            try:
+                result["debug_info"]["page_title"] = await page.title()
+                # 获取 body 的前 500 个字符，看看是不是显示 "Access Denied" 或者 "403"
+                content = await page.evaluate("document.body.innerText")
+                result["debug_info"]["page_text_preview"] = content[:500] if content else "No content"
+            except:
+                pass
 
             # --- 交互策略 ---
             
-            # 1. 暴力点击：模拟用户点击屏幕中心（通常是播放大按钮的位置）
-            logger.info("Attempting blind center tap...")
-            try:
-                # 获取视口大小
-                viewport = page.viewport_size
-                if viewport:
-                    cx, cy = viewport['width'] / 2, viewport['height'] / 3 # 点击偏上一点，避开底部控制栏
-                    await page.mouse.click(cx, cy)
-                    await asyncio.sleep(1)
-                    await page.mouse.click(cx, cy) # 双击有时能触发
-            except Exception as e:
-                logger.warning(f"Blind tap failed: {e}")
+            # 1. 查找 iframe
+            frames = page.frames
+            logger.info(f"Found {len(frames)} frames")
 
-            # 2. 智能查找并点击
-            async def interact_with_frames():
-                frames = page.frames
-                play_selectors = [
-                    "video",
-                    ".vjs-big-play-button", 
-                    "div[class*='play']",
-                    "button[class*='play']",
-                    "img[src*='play']",
-                    ".dplayer-mobile-play"
-                ]
-                
-                for frame in frames:
-                    try:
-                        # 尝试点击 video 标签本身
-                        videos = frame.locator("video")
-                        count = await videos.count()
-                        if count > 0:
-                            logger.info(f"Found video tag in frame {frame.url}, tapping...")
-                            await videos.first.click(force=True)
-                            await asyncio.sleep(0.5)
-                        
-                        # 尝试点击播放按钮
-                        for sel in play_selectors:
-                            btn = frame.locator(sel).first
-                            if await btn.count() > 0 and await btn.is_visible():
-                                logger.info(f"Clicking selector {sel}")
-                                await btn.click(force=True)
-                    except:
-                        pass
+            # 2. 暴力点击中心 + 寻找 Play 按钮
+            viewport = page.viewport_size
+            if viewport:
+                # 点击屏幕中心
+                await page.mouse.click(viewport['width'] / 2, viewport['height'] / 2)
+                await asyncio.sleep(0.5)
+                # 点击屏幕上方 1/3 处 (视频通常在这里)
+                await page.mouse.click(viewport['width'] / 2, viewport['height'] / 3)
             
-            await interact_with_frames()
-            
-            # 3. 等待捕获
-            for i in range(8):
-                if captured_data["m3u8"]: break
-                logger.info(f"Waiting for traffic... {i}")
+            # 3. 遍历点击
+            for frame in frames:
+                try:
+                    # 尝试点击 video 标签
+                    await frame.locator("video").first.click(timeout=1000, force=True)
+                except:
+                    pass
+                try:
+                    # 尝试点击任何看起来像播放按钮的东西
+                    btns = frame.locator("div[class*='play'], button, img[src*='play']")
+                    count = await btns.count()
+                    for i in range(min(count, 3)): # 只点前3个，省时间
+                        try:
+                            await btns.nth(i).click(timeout=500, force=True)
+                        except:
+                            pass
+                except:
+                    pass
+
+            # 等待请求捕获
+            for _ in range(5):
+                if result["debug_info"]["all_video_candidates"]: break
                 await asyncio.sleep(1)
-                
+
         except Exception as e:
-            logger.error(f"Global error: {e}")
+            logger.error(f"Error: {e}")
+            result["error"] = str(e)
         finally:
             await browser.close()
 
-    # 优先返回 szsummer.cn 的链接
-    target = None
-    all_urls = captured_data["m3u8"] + captured_data["mp4"] + captured_data["flv"]
+    # --- 结果处理 ---
+    candidates = result["debug_info"]["all_video_candidates"]
     
-    if not all_urls:
-         raise HTTPException(status_code=404, detail="Could not find any video request. Site might be blocking IP or using WebSocket.")
-
-    # 筛选逻辑
-    for u in captured_data["m3u8"]:
-        if "szsummer.cn" in u:
-            target = u
+    # 1. 优先找 szsummer
+    for c in candidates:
+        if "szsummer.cn" in c:
+            result["video_url"] = c
+            result["source_type"] = "szsummer_match"
             break
             
-    if not target and all_urls:
-        target = all_urls[0]
+    # 2. 其次找 m3u8
+    if not result["video_url"]:
+        for c in candidates:
+            if ".m3u8" in c:
+                result["video_url"] = c
+                result["source_type"] = "generic_m3u8"
+                break
+    
+    # 3. 兜底
+    if not result["video_url"] and candidates:
+        result["video_url"] = candidates[0]
+        result["source_type"] = "fallback"
 
-    return {
-        "code": 200,
-        "m3u8_url": target,
-        "all_candidates": all_urls
-    }
+    # 4. 转换 set 为 list 以便 JSON 序列化
+    result["debug_info"]["domains_contacted"] = list(result["debug_info"]["domains_contacted"])
+
+    if result["video_url"]:
+        result["status"] = "success"
+        # 成功时简化返回，但也保留 debug_info 供查看
+        return result
+    else:
+        # 失败时返回 200 但 status=failed，这样你能看到 debug_info
+        result["status"] = "failed"
+        result["message"] = "No video traffic detected. Check debug_info for page status."
+        return JSONResponse(content=result)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
