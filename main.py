@@ -5,6 +5,7 @@ import uvicorn
 import asyncio
 import logging
 import random
+import os  # 新增：用于读取环境变量
 from urllib.parse import urlparse
 
 # 配置日志
@@ -154,7 +155,8 @@ async def extract_m3u8(url: str = Query(..., description="The target video page 
             logger.info("Navigating...")
             # 使用 try-except 包裹 goto 防止导航超时
             try:
-                response = await page.goto(url, wait_until="commit", timeout=30000)
+                # 增加超时时间到 45000ms (45秒)，应对可能的网络延迟
+                response = await page.goto(url, wait_until="commit", timeout=45000)
                 if response:
                     logger.info(f"Response status: {response.status}")
             except Exception as e:
@@ -286,4 +288,9 @@ async def extract_m3u8(url: str = Query(..., description="The target video page 
     return JSONResponse(content=result)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # --- 关键修改：读取环境变量 PORT ---
+    # Leaflow 等云平台会通过 PORT 环境变量告诉应用应该监听哪个端口
+    # 如果没有读取到，则默认使用 8000
+    port = int(os.environ.get("PORT", 8000))
+    logger.info(f"Starting server on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
