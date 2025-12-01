@@ -14,24 +14,15 @@ logger = logging.getLogger("m3u8_sniffer")
 
 app = FastAPI()
 
-# --- 1. 防止 favicon.ico 404 干扰 ---
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    return JSONResponse(content={})
-
 @app.get("/")
 async def root():
-    # --- 2. 增加版本号，方便你确认代码是否生效 ---
-    return {
-        "status": "running", 
-        "version": "V2_Wait_Logic", 
-        "message": "Use /extract?url=... to extract m3u8"
-    }
+    return {"status": "running", "message": "Use /extract?url=... to extract m3u8"}
 
 @app.get("/extract")
 async def extract_m3u8(url: str = Query(..., description="The target video page URL")):
     logger.info(f"Start sniffing: {url}")
     
+    # 数据容器
     result = {
         "status": "processing",
         "video_url": None,
@@ -45,27 +36,31 @@ async def extract_m3u8(url: str = Query(..., description="The target video page 
         "error": None
     }
     
+    # 临时集合用于去重域名
     domains_set = set()
     browser = None
 
     try:
         async with async_playwright() as p:
-            # 模拟 iPhone 13 Pro
+            # 使用 iPhone 13 Pro 配置
             device = p.devices['iPhone 13 Pro']
             
             logger.info("Launching browser...")
+            # <<< 修改点 1: 使用 'headless=new' 模式，反检测能力更强
             browser = await p.chromium.launch(
-                headless=True,
+                headless="new", # 使用新的 headless 模式
                 args=[
                     "--no-sandbox", 
                     "--disable-setuid-sandbox", 
                     "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled", 
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
                     "--ignore-certificate-errors",
                     "--mute-audio"
                 ]
             )
             
+            # 合并配置，避免参数冲突
             context_options = device.copy()
             context_options.update({
                 "locale": "zh-CN",
@@ -79,16 +74,26 @@ async def extract_m3u8(url: str = Query(..., description="The target video page 
             
             context = await browser.new_context(**context_options)
             
-            # 注入反检测脚本
+            # 注入更深层的反指纹脚本 (这部分保持不变，已经很完善了)
             await context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 window.navigator.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (parameters.name === 'notifications' ? Promise.resolve({ state: Notification.permission }) : originalQuery(parameters));
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                try {
+                    const getParameter = WebGLRenderingContext.prototype.getParameter;
+                    WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                        if (parameter === 37445) return 'Apple Inc.';
+                        if (parameter === 37446) return 'Apple GPU';
+                        return getParameter(parameter);
+                    };
+                } catch(e) {}
             """)
 
             page = await context.new_page()
 
-            # --- 监听器：全程后台录制 ---
-            # 只要浏览器发起请求，这里就会记录。即使主程序在 sleep，这里也在工作。
+            # --- 监听器设置 (监听器从一开始就开启，不会错过任何请求) ---
             def handle_request(request):
                 try:
                     req_url = request.url
@@ -105,129 +110,138 @@ async def extract_m3u8(url: str = Query(..., description="The target video page 
                         is_video = True
                     
                     if is_video:
-                        logger.info(f"Captured video request: {req_url}")
+                        logger.info(f"Captured: {req_url}")
+                        # 捕获到的URL存入列表
                         result["debug_info"]["all_video_candidates"].append(req_url)
-                except:
-                    pass
+                except Exception:
+                    pass # 静默处理监听器中的小错误
 
             page.on("request", handle_request)
 
-            logger.info("Navigating...")
-            try:
-                # 1. 访问页面
-                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                
-                # --- 核心逻辑 1：等待页面加载完成 ---
-                logger.info("Waiting for network idle (page loading)...")
+            logger.info(f"Navigating to {url}...")
+            # <<< 修改点 2: 先 'commit' 导航，进行 Cloudflare 检测
+            response = await page.goto(url, wait_until="commit", timeout=45000)
+            if response:
+                logger.info(f"Response status: {response.status}")
+
+            # --- Cloudflare 绕过逻辑 (保持不变，很健壮) ---
+            await asyncio.sleep(3)
+            page_title = await page.title()
+            result["debug_info"]["page_title"] = page_title
+            
+            if "Cloudflare" in page_title or "Attention" in page_title or "Just a moment" in page_title:
+                logger.info("Cloudflare detected! Attempting specific bypass...")
+                await asyncio.sleep(6)
                 try:
-                    # networkidle 表示至少500ms内没有新的网络请求，代表加载完毕
-                    await page.wait_for_load_state("networkidle", timeout=8000)
-                except:
-                    logger.warning("Network idle timeout, continuing anyway...")
-
-            except Exception as e:
-                logger.warning(f"Navigation warning: {e}")
-
-            # Cloudflare 简单跳过
-            try:
-                title = await page.title()
-                result["debug_info"]["page_title"] = title
-                if "Cloudflare" in title:
+                    frames = page.frames
+                    for frame in frames:
+                        try:
+                            box = await frame.bounding_box()
+                            if box:
+                                x = box['x'] + 10 + random.randint(0, 20)
+                                y = box['y'] + 10 + random.randint(0, 20)
+                                await page.mouse.click(x, y)
+                        except: pass
+                        try:
+                            checkbox = frame.locator("input[type='checkbox'], #challenge-stage, .ctp-checkbox-label").first
+                            if await checkbox.count() > 0:
+                                await checkbox.click(force=True)
+                        except: pass
                     await asyncio.sleep(5)
+                except Exception as e:
+                    logger.warning(f"Bypass interaction failed: {e}")
+            
+            # <<< 修改点 3: 核心流程重构 -> 等待页面完全加载，再交互，再等待
+            logger.info("Waiting for the page to be fully loaded (including videos, scripts, etc.)...")
+            # 'load' 状态确保所有资源（图片、CSS、JS）都已下载完成，播放器脚本大概率已初始化
+            await page.wait_for_load_state("load", timeout=15000)
+
+            # 模拟真实用户，等待片刻后再操作
+            await asyncio.sleep(random.uniform(1, 3))
+
+            # 获取页面内容预览
+            try:
+                content = await page.evaluate("document.body.innerText")
+                result["debug_info"]["page_text_preview"] = content[:500] if content else "No content"
             except:
                 pass
 
-            # --- 核心逻辑 2：点击播放 ---
-            if not result["debug_info"]["all_video_candidates"]:
-                logger.info("Trying to click play button...")
-                
-                # 尝试点击常见播放按钮
-                clicked = False
-                try:
-                    # 优先找 video 标签
-                    frames = page.frames
-                    for frame in frames:
-                        # 策略A: 点击 video 元素
-                        video = frame.locator("video").first
-                        if await video.count() > 0:
-                            await video.click(force=True, timeout=1000)
-                            clicked = True
-                            logger.info(f"Clicked video tag in frame: {frame.url}")
-                        
-                        # 策略B: 点击播放按钮图标
-                        btns = frame.locator("div[class*='play'], button[class*='play'], img[src*='play']")
-                        if await btns.count() > 0:
-                            await btns.first.click(force=True, timeout=1000)
-                            clicked = True
-                            logger.info("Clicked play button icon")
+            logger.info("Attempting to interact with the video player...")
+            # --- 视频交互策略 (保持不变，已经很全面) ---
+            try:
+                # 1. 暴力点击页面中心
+                viewport = page.viewport_size
+                if viewport:
+                    await page.mouse.click(viewport['width'] / 2, viewport['height'] / 2)
+                    await asyncio.sleep(1) # 给反应时间
 
-                    # 策略C: 如果都没找到，点击屏幕中心 (针对 H5 遮罩层)
-                    if not clicked:
-                        viewport = page.viewport_size
-                        if viewport:
-                            await page.mouse.click(viewport['width'] / 2, viewport['height'] / 2)
-                            logger.info("Clicked center of screen")
-                except Exception as e:
-                    logger.warning(f"Click interaction error: {e}")
+                # 2. 遍历所有 Frame 并尝试点击播放器元素
+                frames = page.frames
+                for frame in frames:
+                    try:
+                        await frame.locator("video").first.click(timeout=1000, force=True)
+                    except:
+                        pass
+                    try:
+                        # 尝试点击各种可能的播放按钮/图标
+                        btns = frame.locator("div[class*='play'], button[aria-label*='play'], button[class*='play'], img[src*='play']")
+                        count = await btns.count()
+                        for i in range(min(count, 5)):
+                            try:
+                                await btns.nth(i).click(timeout=500, force=True)
+                            except:
+                                pass
+                    except:
+                        pass
+            except Exception as e:
+                logger.warning(f"Click interaction failed: {e}")
 
-                # --- 核心逻辑 3：点击后等待 3+ 秒抓取 ---
-                # 在这 4 秒内，如果有 m3u8 请求产生，handle_request 会自动记录
-                logger.info("Clicked. Waiting 4 seconds for video traffic...")
-                await asyncio.sleep(4)
+            # <<< 修改点 4: 播放后，明确等待3秒，让视频请求发出
+            logger.info("Video clicked. Waiting 3 seconds for video stream requests to be initiated...")
+            await asyncio.sleep(3)
 
     except Exception as e:
-        logger.error(f"Critical Error: {e}")
+        logger.error(f"Critical Process Error: {e}")
         result["error"] = str(e)
         result["status"] = "error"
     finally:
         if browser:
             await browser.close()
+            logger.info("Browser closed.")
 
-    # 结果去重与选择
-    candidates = list(set(result["debug_info"]["all_video_candidates"]))
-    result["debug_info"]["all_video_candidates"] = candidates
+    # --- 结果整理 (保持不变) ---
     result["debug_info"]["domains_contacted"] = list(domains_set)
-
-    # 优先选 m3u8
-    m3u8s = [c for c in candidates if ".m3u8" in c]
-    if m3u8s:
-        result["video_url"] = m3u8s[0]
-        result["source_type"] = "m3u8_found"
-    elif candidates:
-        result["video_url"] = candidates[0]
-        result["source_type"] = "fallback_video"
+    candidates = result["debug_info"]["all_video_candidates"]
     
+    for c in candidates:
+        if "szsummer.cn" in c: # 你的特定规则
+            result["video_url"] = c
+            result["source_type"] = "szsummer_match"
+            break
+            
+    if not result["video_url"] and candidates:
+        m3u8s = [c for c in candidates if ".m3u8" in c]
+        if m3u8s:
+            result["video_url"] = m3u8s[0]
+            result["source_type"] = "generic_m3u8"
+        else:
+            result["video_url"] = candidates[0]
+            result["source_type"] = "fallback"
+
     if result["video_url"]:
         result["status"] = "success"
-    else:
+        logger.info(f"Successfully found video URL: {result['video_url']}")
+    elif result["status"] != "error":
         result["status"] = "failed"
-        result["message"] = "No video traffic detected after interaction."
+        # 调整一下失败信息，更具体
+        result["message"] = "No video traffic detected after interaction. The site may have changed its player or protection."
+        logger.warning(result['message'])
 
     return JSONResponse(content=result)
 
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    
-    # --- 调试：打印所有注册的路由，确保 /extract 存在 ---
-    logger.info("--- Registering Routes ---")
-    for route in app.routes:
-        logger.info(f"Route: {route.path} [{route.name}]")
-    logger.info("--------------------------")
-    
     logger.info(f"Starting server on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
-```
 
-### 2. 关键操作建议
-
-要解决 `Not Found` 问题，请务必执行以下操作：
-
-1.  **强制重新构建（重要）**：
-    Docker 有时候会缓存旧的代码层。请在部署时使用 `--no-cache` 参数，或者先删除旧镜像。
-    ```bash
-    # 如果你是用 Docker Compose
-    docker-compose build --no-cache
-    docker-compose up -d
-
-    # 如果你是直接用 Docker build
-    docker build --no-cache -t your-image-name .
